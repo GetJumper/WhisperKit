@@ -78,33 +78,82 @@ struct TranscribeCLI: AsyncParsableCommand {
         let whisperKit = try await setupWhisperKit()
 
         if cliArguments.verbose {
-            print("Models initialized")
+            print("Models initialized in \(String(format: "%.2f", whisperKit.currentTimings.modelLoading)) seconds")
+            print("  - Encoder load time: \(String(format: "%.2f", whisperKit.currentTimings.encoderLoadTime)) seconds")
+            print("  - Decoder load time: \(String(format: "%.2f", whisperKit.currentTimings.decoderLoadTime)) seconds")
+            print("  - Tokenizer load time: \(String(format: "%.2f", whisperKit.currentTimings.tokenizerLoadTime)) seconds")
         }
 
         var options = decodingOptions(task: task)
-        if let promptText = cliArguments.prompt, promptText.count > 0, let tokenizer = whisperKit.tokenizer {
-            options.promptTokens = tokenizer.encode(text: " " + promptText.trimmingCharacters(in: .whitespaces)).filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+
+        if options.language == nil {
+            // Use the first audio path for language detection
+            let resolvedAudioPath = resolvedAudioPaths.first!
+            do {
+                let (detectedLanguage, _) = try await whisperKit.detectLanguage(audioPath: resolvedAudioPath)
+                options.language = detectedLanguage
+                print("Detected language: \(detectedLanguage)")
+                // Update usePrefillPrompt since language is now set
+                options.usePrefillPrompt = cliArguments.usePrefillPrompt || options.language != nil
+            } catch {
+                print("Error when detecting language for \(resolvedAudioPath): \(error)")
+            }
+        }
+
+        // Handle prompts if provided
+        if let promptText = cliArguments.prompt, !promptText.isEmpty, let tokenizer = whisperKit.tokenizer {
+            options.promptTokens = tokenizer.encode(text: " " + promptText.trimmingCharacters(in: .whitespaces))
+                .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
             options.usePrefillPrompt = true
         }
 
-        if let prefixText = cliArguments.prefix, prefixText.count > 0, let tokenizer = whisperKit.tokenizer {
-            options.prefixTokens = tokenizer.encode(text: " " + prefixText.trimmingCharacters(in: .whitespaces)).filter { $0 < tokenizer.specialTokens.specialTokenBegin }
+        // Handle prefixes if provided
+        if let prefixText = cliArguments.prefix, !prefixText.isEmpty, let tokenizer = whisperKit.tokenizer {
+            options.prefixTokens = tokenizer.encode(text: " " + prefixText.trimmingCharacters(in: .whitespaces))
+                .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
             options.usePrefillPrompt = true
         }
 
-        let transcribeResult: [Result<[TranscriptionResult], Swift.Error>] = await whisperKit.transcribeWithResults(
+        var isTranscribing = true
+
+        // Start the progress percentage task
+        let progressTask = Task {
+            var lastProgressPercentage = -1
+            while isTranscribing {
+                let progress = whisperKit.progress.fractionCompleted
+                let progressPercentage = Int(progress * 100)
+                if progressPercentage != lastProgressPercentage {
+                    print("\(progressPercentage)%")
+                    lastProgressPercentage = progressPercentage
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000) // Sleep for 0.1 seconds
+            }
+        }
+
+        // Start the transcription
+        let transcribeResult = await whisperKit.transcribeWithResults(
             audioPaths: resolvedAudioPaths,
             decodeOptions: options
         )
 
-        // TODO: we need to track the results between audio files, and shouldnt merge them
-        // ONLY merge results for different chunks of the same audio file or array
+        // Indicate that transcription is done
+        isTranscribing = false
+        // Wait for the progress task to finish
+        await progressTask.value
+
+        // Continue with processing the transcription results
         let allSuccessfulResults = transcribeResult.compactMap { try? $0.get() }.flatMap { $0 }
 
         // Log timings for full transcription run
         if cliArguments.verbose {
             let mergedResult = mergeTranscriptionResults(allSuccessfulResults)
             mergedResult.logTimings()
+            // Output tokensPerSecond, realTimeFactor, and speedFactor
+            let timings = mergedResult.timings
+            print("Transcription Performance:")
+            print(String(format: "  - Tokens per second: %.2f", timings.tokensPerSecond))
+            print(String(format: "  - Real-time factor: %.2f", timings.realTimeFactor))
+            print(String(format: "  - Speed factor: %.2f", timings.speedFactor))
         }
 
         for (audioPath, result) in zip(resolvedAudioPaths, transcribeResult) {
@@ -390,3 +439,4 @@ struct TranscribeCLI: AsyncParsableCommand {
         }
     }
 }
+
